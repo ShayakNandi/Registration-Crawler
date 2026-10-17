@@ -11,8 +11,31 @@ from pathlib import Path
 def read_jsonl(path):
     if not path.exists():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip()]
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def expand_events(event):
+    """Yield (page, index, form) triples from a crawl record.
+
+    Newer crawls may also carry `fallback_pages` discovered by probing
+    common registration URLs when the seed page itself had no form.
+    """
+    main_page = event.get("url", event.get("requested_url", ""))
+    yield main_page, event.get("title", ""), event.get("forms", [])
+
+    for fallback in event.get("fallback_pages", []) or []:
+        yield (
+            fallback.get("url", ""),
+            fallback.get("title", ""),
+            fallback.get("forms", []),
+        )
 
 
 def make_report(folder):
@@ -24,7 +47,7 @@ def make_report(folder):
         if kind in {"attempt_started", "attempt_result"}:
             attempts[event["key"]] = event
         elif kind in {"form_skipped", "page_skipped"}:
-            skipped[(event.get("page"), event.get("form_index"))] = event
+            skipped[(event.get("page"), str(event.get("form_index")))] = event
 
     rows = []
     for event in attempts.values():
@@ -32,8 +55,7 @@ def make_report(folder):
             "service": event.get("service", ""), "page": event.get("page", ""),
             "status": event.get("result", "unknown/interrupted"),
             "information_sent": json.dumps(event.get("information", []), ensure_ascii=False),
-            "submission_endpoint": event.get("endpoint", ""),
-            "http_status": event.get("http_status", ""),
+            "submission_endpoint": event.get("endpoint", ""), "http_status": event.get("http_status", ""),
             "response_evidence_or_reason": event.get("evidence", "No final result recorded"),
             "time": event.get("time", ""),
         })
@@ -45,23 +67,26 @@ def make_report(folder):
             "response_evidence_or_reason": event.get("reason", ""),
             "time": event.get("time", ""),
         })
-    processed = {(e.get("page"), e.get("form_index")) for e in events
+    processed = {(e.get("page"), str(e.get("form_index"))) for e in events
                  if e.get("event") in {"attempt_started", "attempt_result", "form_skipped"}}
     # Include discovered forms not reached because of limits or deduplication.
     for event in read_jsonl(folder / "crawl.jsonl"):
-        page = event.get("url", event.get("requested_url", ""))
-        for index, form in enumerate(event.get("forms", [])):
-            if (page, form.get("index", index)) not in processed:
-                rows.append({
-                    "service": event.get("title", ""), "page": page,
-                    "status": "not_processed", "information_sent": "None",
-                    "submission_endpoint": form.get("action", ""), "http_status": "",
-                    "response_evidence_or_reason": "Not reached or skipped by per-site/deduplication limits; see log",
-                    "time": event.get("fetched_at", ""),
-                })
+        for page, title, forms in expand_events(event):
+            for index, form in enumerate(forms or []):
+                if (page, str(form.get("index", index))) not in processed:
+                    rows.append({
+                        "service": title, "page": page,
+                        "status": "not_processed", "information_sent": "None",
+                        "submission_endpoint": form.get("action", ""), "http_status": "",
+                        "response_evidence_or_reason": "Not reached or skipped by per-site/deduplication limits; see log",
+                        "time": event.get("fetched_at", ""),
+                    })
     # Include discovery failures and pages with no forms, too.
     for event in read_jsonl(folder / "crawl.jsonl"):
-        if event.get("status") != "ok" or not event.get("forms"):
+        has_any_forms = any(
+            forms for _p, _t, forms in expand_events(event)
+        )
+        if event.get("status") != "ok" or not has_any_forms:
             rows.append({
                 "service": event.get("title", ""),
                 "page": event.get("url", event.get("requested_url", "")),
@@ -109,10 +134,14 @@ def make_report(folder):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("urls", nargs="*",
+                        help="Any links you want signed up on (site homepages or direct signup pages).")
+    parser.add_argument("--url-file", help="File with one input link per line.")
     parser.add_argument("--email", required=True)
     parser.add_argument("--name", default="")
     parser.add_argument("--max-pages", type=int, default=30)
     parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--delay", type=float, default=3)
     parser.add_argument("--max-submissions", type=int, default=10)
     args = parser.parse_args()
     folder = Path(__file__).resolve().parent
@@ -121,12 +150,16 @@ def main():
             parser.error(f"Put {name} in the same folder as this launcher")
     try:
         print("STEP 1: Finding forms...", flush=True)
-        subprocess.run([sys.executable, "freebies_crawler.py", "--max-pages", str(args.max_pages),
-                        "--depth", str(args.depth)], cwd=folder, check=True)
+        cmd = [sys.executable, "freebies_crawler.py", "--max-pages", str(args.max_pages),
+               "--depth", str(args.depth), "--delay", str(args.delay)]
+        if args.url_file:
+            cmd += ["--url-file", args.url_file]
+        cmd += list(args.urls)
+        subprocess.run(cmd, cwd=folder, check=True)
         print("STEP 2: Submitting eligible forms...", flush=True)
         subprocess.run([sys.executable, "signup_services.py", "--email", args.email,
                         "--name", args.name, "--max-submissions", str(args.max_submissions),
-                        "--submit"], cwd=folder, check=True)
+                        "--delay", str(args.delay), "--submit"], cwd=folder, check=True)
     except subprocess.CalledProcessError as error:
         print(f"A step failed (exit {error.returncode}); reporting any available results.", flush=True)
         raise
